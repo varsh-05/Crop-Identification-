@@ -1,0 +1,5 @@
+cropenv/
+__pycache__/
+*.h5
+.env
+dataset/
