@@ -1,593 +1,1021 @@
-"""
-CropID — Multimodal Crop Identification & Nutrition System
-Run:  python -m streamlit run app.py
-"""
-
 import streamlit as st
-import os, base64, warnings, hashlib, ssl
 import numpy as np
-import tensorflow as tf
-from PIL import Image, ImageFilter, ImageEnhance
+from PIL import Image, ImageEnhance
+import os, io, base64, json, time, requests
 from groq import Groq
 from dotenv import load_dotenv
-import requests
-from io import BytesIO
-import urllib.request
 
-warnings.filterwarnings('ignore')
-
-# Fix SSL issues on macOS
-ssl._create_default_https_context = ssl._create_unverified_context
-
-# ══════════════════════════════════════════════
-#  PAGE CONFIG
-# ══════════════════════════════════════════════
-st.set_page_config(
-    page_title="CropID — AI Crop System",
-    page_icon="🌿",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
-
-# ══════════════════════════════════════════════
-#  CUSTOM CSS
-# ══════════════════════════════════════════════
-st.markdown("""
-<style>
-@import url('https://fonts.googleapis.com/css2?family=Syne:wght@400;700;800&family=DM+Sans:wght@300;400;500&display=swap');
-
-html, body, [class*="css"] { font-family: 'DM Sans', sans-serif; }
-h1, h2, h3 { font-family: 'Syne', sans-serif; }
-
-[data-testid="stSidebar"] {
-    background: linear-gradient(160deg, #0d2b1a 0%, #163d28 100%);
-}
-[data-testid="stSidebar"] * { color: #d4edda !important; }
-.stApp { background: #f4f8f5; }
-
-/* ── Compact metric cards ── */
-.metric-row { display:flex; gap:10px; margin:12px 0; }
-.metric-card {
-    flex:1; border-radius:10px; padding:10px 12px;
-    text-align:center; color:white;
-}
-.metric-card .m-val {
-    font-family:'Syne',sans-serif; font-size:1.05rem;
-    font-weight:800; line-height:1.3; word-break:break-word;
-}
-.metric-card .m-lbl {
-    font-size:0.65rem; opacity:0.85;
-    letter-spacing:.06em; text-transform:uppercase; margin-top:3px;
-}
-
-/* ── Source badge ── */
-.source-badge {
-    display:inline-block; padding:3px 10px; border-radius:20px;
-    font-size:0.75rem; font-weight:700; margin-bottom:8px;
-    letter-spacing:.05em; text-transform:uppercase;
-}
-
-/* ── Prediction bars ── */
-.pred-bar-wrap { margin:7px 0; }
-.pred-bar-label {
-    display:flex; justify-content:space-between;
-    font-size:0.82rem; margin-bottom:3px;
-    font-weight:500; color:#1a1a1a;
-}
-.pred-bar-bg {
-    background:#e2ede6; border-radius:6px;
-    height:13px; width:100%; overflow:hidden;
-}
-.pred-bar-fill { height:13px; border-radius:6px; }
-
-/* ── Buttons ── */
-div.stButton > button {
-    background:linear-gradient(135deg,#1a5c35,#2e8b57);
-    color:white; border:none; border-radius:10px;
-    font-family:'Syne',sans-serif; font-weight:700;
-    font-size:0.95rem; padding:0.6rem 1.5rem;
-    width:100%; transition:all .25s;
-}
-div.stButton > button:hover {
-    background:linear-gradient(135deg,#2e8b57,#3aad6e);
-    transform:translateY(-2px);
-    box-shadow:0 6px 20px rgba(46,139,87,.35);
-}
-
-button[data-baseweb="tab"][aria-selected="true"] {
-    border-bottom:3px solid #2e8b57 !important;
-    color:#1a5c35 !important; font-weight:700;
-}
-.stSuccess { border-left:4px solid #2e8b57 !important; }
-.stWarning { border-left:4px solid #f0a500 !important; }
-.stInfo    { border-left:4px solid #3498db !important; }
-</style>
-""", unsafe_allow_html=True)
-
-# ══════════════════════════════════════════════
-#  ENV & API
-# ══════════════════════════════════════════════
+os.chdir(os.path.dirname(os.path.abspath(__file__)))
 load_dotenv()
-GROQ_KEY = os.getenv("GROQ_API_KEY")
-if not GROQ_KEY:
-    st.error("🔑 **GROQ_API_KEY** not found. Add it to your `.env` file.")
-    st.stop()
-
-client       = Groq(api_key=GROQ_KEY)
-VISION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
-CHAT_MODEL   = "llama-3.3-70b-versatile"
-CONF_THRESH  = 0.45
-
-# ══════════════════════════════════════════════
-#  LOAD LOCAL ML ASSETS
-# ══════════════════════════════════════════════
-@st.cache_resource(show_spinner="Loading AI model…")
-def load_assets():
-    if not os.path.exists('crop_model.h5'):
-        raise FileNotFoundError("crop_model.h5 not found. Run `python train.py` first.")
-    if not os.path.exists('labels.txt'):
-        raise FileNotFoundError("labels.txt not found. Run `python train.py` first.")
-    model = tf.keras.models.load_model('crop_model.h5')
-    with open('labels.txt') as f:
-        labels = [l.strip() for l in f if l.strip()]
-    return model, labels
 
 try:
-    local_model, crop_labels = load_assets()
-except FileNotFoundError as e:
-    st.error(str(e)); st.stop()
+    import tensorflow as tf
+    TF_AVAILABLE = True
+except Exception:
+    TF_AVAILABLE = False
 
-# ══════════════════════════════════════════════
-#  IMAGE ENHANCEMENT
-# ══════════════════════════════════════════════
-def enhance_image(image: Image.Image) -> Image.Image:
-    img = image.convert("RGB")
-    img = img.filter(ImageFilter.SHARPEN)
-    img = img.filter(ImageFilter.UnsharpMask(radius=2, percent=180, threshold=3))
-    img = ImageEnhance.Contrast(img).enhance(1.5)
-    mean_lum = np.array(img).mean()
-    if mean_lum < 70:
-        img = ImageEnhance.Brightness(img).enhance(1.7)
-    elif mean_lum > 210:
-        img = ImageEnhance.Brightness(img).enhance(0.75)
-    img = ImageEnhance.Color(img).enhance(1.3)
-    return img
+st.set_page_config(
+    page_title="CropID — AI Crop Intelligence",
+    page_icon="🌿",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
-# ══════════════════════════════════════════════
-#  LOCAL ML PREDICTION (backup)
-# ══════════════════════════════════════════════
-def local_predict(img: Image.Image):
-    def _run(i):
-        i   = i.convert("RGB").resize((224, 224))
-        arr = tf.keras.preprocessing.image.img_to_array(i) / 255.0
-        arr = np.expand_dims(arr, 0)
-        return local_model.predict(arr, verbose=0)[0]
-
-    probs = _run(img)
-    conf  = float(np.max(probs))
-
-    if conf < CONF_THRESH:
-        probs2 = _run(enhance_image(img))
-        if float(np.max(probs2)) > conf:
-            probs, conf = probs2, float(np.max(probs2))
-
-    top5 = [(crop_labels[i], round(float(probs[i]) * 100, 1))
-            for i in np.argsort(probs)[::-1][:5]]
-
-    return crop_labels[int(np.argmax(probs))], round(conf * 100, 1), top5
-
-# ══════════════════════════════════════════════
-#  GROQ VISION — PRIMARY IDENTIFIER
-#  Much more accurate than local model
-# ══════════════════════════════════════════════
-def encode_image(image: Image.Image) -> str:
-    buf = BytesIO()
-    image.convert("RGB").save(buf, format="JPEG", quality=88)
-    return base64.b64encode(buf.getvalue()).decode()
-
-def groq_identify(image: Image.Image) -> tuple:
-    """Use Groq Vision to identify the crop.
-    Returns (label, confidence, reason, top5_list)
-    top5_list = [(name, confidence), ...]
-    """
-    b64       = encode_image(image)
-    supported = ", ".join(crop_labels)
-
-    prompt = f"""Look at this image carefully and identify the crop/plant shown.
-
-Choose ONLY from this list: {supported}
-
-Reply in this EXACT format (nothing else, no extra text):
-CROP: <best match from the list>
-CONFIDENCE: <number 1-100>
-REASON: <one sentence why>
-ALT1: <2nd most likely crop from list>
-ALT1_CONF: <confidence 1-100>
-ALT2: <3rd most likely crop from list>
-ALT2_CONF: <confidence 1-100>
-ALT3: <4th most likely crop from list>
-ALT3_CONF: <confidence 1-100>
-ALT4: <5th most likely crop from list>
-ALT4_CONF: <confidence 1-100>
-
-If you cannot identify any crop, use "unknown" for CROP."""
-
-    resp = client.chat.completions.create(
-        model=VISION_MODEL,
-        messages=[{"role": "user", "content": [
-            {"type": "text", "text": prompt},
-            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
-        ]}],
-        max_tokens=200
-    )
-
-    text  = resp.choices[0].message.content.strip()
-    data  = {}
-    for line in text.split('\n'):
-        if ':' in line:
-            key, _, val = line.partition(':')
-            data[key.strip()] = val.strip()
-
-    def _match(raw):
-        if not raw or raw.lower() == "unknown":
-            return "unknown"
-        for c in crop_labels:
-            if c.lower() == raw.lower():
-                return c
-        for c in crop_labels:
-            if raw.lower() in c.lower() or c.lower() in raw.lower():
-                return c
-        return raw   # keep as-is if no match
-
-    def _conf(key):
-        try:    return max(0, min(100, int(data.get(key, 0))))
-        except: return 0
-
-    label      = _match(data.get("CROP", "unknown"))
-    confidence = _conf("CONFIDENCE")
-    reason     = data.get("REASON", "")
-
-    # Build top-5 from Groq's alternatives
-    top5 = [(label, confidence)]
-    for i in range(1, 5):
-        alt_name = _match(data.get(f"ALT{i}", ""))
-        alt_conf = _conf(f"ALT{i}_CONF")
-        if alt_name and alt_name != "unknown":
-            top5.append((alt_name, alt_conf))
-
-    # Pad to 5 if needed
-    while len(top5) < 5:
-        top5.append(("—", 0))
-
-    return label, confidence, reason, top5
-
-# ══════════════════════════════════════════════
-#  GROQ DIET REPORT
-# ══════════════════════════════════════════════
-def groq_diet_report(image: Image.Image, label: str) -> str:
-    b64 = encode_image(image)
-    prompt = f"""The crop identified is **{label}**.
-
-Generate a comprehensive **Human Diet & Nutrition Report**:
-
-## 1. 🌾 Crop Overview
-Brief description and culinary significance.
-
-## 2. 📊 Nutritional Profile (per 100 g)
-Table: calories, carbs, protein, fat, fibre, key vitamins & minerals.
-
-## 3. 💪 Top Health Benefits
-At least 6 evidence-based benefits with explanations.
-
-## 4. 📅 Recommended Daily Intake
-For: Children · Teenagers · Adults · Elderly · Pregnant women
-
-## 5. 🍽️ Best Ways to Consume
-Raw vs cooked vs processed — which preserves most nutrients.
-
-## 6. 📆 Sample Weekly Diet Plan
-7-day plan (Mon–Sun) with Breakfast / Lunch / Dinner using **{label}**.
-
-## 7. ⚠️ Who Should Limit or Avoid
-Groups who should be careful.
-
-Focus ONLY on human nutrition. Do NOT mention soil, water, or farming.
-"""
-    resp = client.chat.completions.create(
-        model=VISION_MODEL,
-        messages=[{"role": "user", "content": [
-            {"type": "text", "text": prompt},
-            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
-        ]}],
-        max_tokens=2048
-    )
-    return resp.choices[0].message.content
-
-# ══════════════════════════════════════════════
-#  URL IMAGE LOADER — fixed with SSL + headers
-# ══════════════════════════════════════════════
-def load_image_from_url(url: str):
-    try:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                          "AppleWebKit/537.36 (KHTML, like Gecko) "
-                          "Chrome/120.0.0.0 Safari/537.36"
-        }
-        r = requests.get(url, headers=headers, timeout=15, verify=False)
-        r.raise_for_status()
-        img = Image.open(BytesIO(r.content))
-        return img, None
-    except Exception as e1:
-        try:
-            # Fallback: urllib
-            req = urllib.request.Request(url, headers={
-                "User-Agent": "Mozilla/5.0"
-            })
-            ctx = ssl.create_default_context()
-            ctx.check_hostname = False
-            ctx.verify_mode    = ssl.CERT_NONE
-            with urllib.request.urlopen(req, context=ctx, timeout=15) as r:
-                img = Image.open(BytesIO(r.read()))
-                return img, None
-        except Exception as e2:
-            return None, f"Could not load image: {e2}"
-
-# ══════════════════════════════════════════════
-#  IMAGE HASH
-# ══════════════════════════════════════════════
-def image_hash(img: Image.Image) -> str:
-    buf = BytesIO()
-    img.convert("RGB").resize((64, 64)).save(buf, format="PNG")
-    return hashlib.md5(buf.getvalue()).hexdigest()
-
-# ══════════════════════════════════════════════
-#  SESSION STATE
-# ══════════════════════════════════════════════
-defaults = {
-    "chat_history": [], "report": "", "id_name": "",
-    "confidence": 0, "is_unclear": False, "top5": [],
-    "last_image_hash": "", "id_source": "", "id_reason": ""
+CROP_INFO = {
+    "wheat": {
+        "season": "Rabi (Oct–Mar)", "water": "450–650 mm", "soil": "Loamy / Clay loam",
+        "price": "Rs 2,015/quintal", "diseases": "Rust, Smut, Blight",
+        "emoji": "🌾", "color": "#d97706",
+        "nutrition": {"Calories": "340 kcal", "Protein": "13g", "Carbs": "72g", "Fiber": "10g", "Fat": "2g"},
+        "diet_uses": ["Chapati", "Bread", "Pasta", "Porridge", "Biscuits"],
+        "health_benefits": "High in fibre, supports digestion, controls blood sugar, rich in B vitamins and iron.",
+        "locations": [
+            {"state": "Punjab", "lat": 31.1471, "lon": 75.3412},
+            {"state": "Haryana", "lat": 29.0588, "lon": 76.0856},
+            {"state": "Uttar Pradesh", "lat": 26.8467, "lon": 80.9462},
+            {"state": "Madhya Pradesh", "lat": 22.9734, "lon": 78.6569},
+            {"state": "Rajasthan", "lat": 27.0238, "lon": 74.2179},
+        ],
+    },
+    "rice": {
+        "season": "Kharif (Jun–Nov)", "water": "1,100–2,000 mm", "soil": "Clay / Silty clay",
+        "price": "Rs 2,183/quintal", "diseases": "Blast, Blight, Brown spot",
+        "emoji": "🍚", "color": "#10b981",
+        "nutrition": {"Calories": "365 kcal", "Protein": "7g", "Carbs": "80g", "Fiber": "1g", "Fat": "1g"},
+        "diet_uses": ["Steamed Rice", "Idli", "Dosa", "Khichdi", "Rice flour"],
+        "health_benefits": "Easy to digest, gluten-free, good energy source, low in fat.",
+        "locations": [
+            {"state": "West Bengal", "lat": 22.9868, "lon": 87.8550},
+            {"state": "Uttar Pradesh", "lat": 26.8467, "lon": 80.9462},
+            {"state": "Punjab", "lat": 31.1471, "lon": 75.3412},
+            {"state": "Andhra Pradesh", "lat": 15.9129, "lon": 79.7400},
+            {"state": "Tamil Nadu", "lat": 11.1271, "lon": 78.6569},
+        ],
+    },
+    "maize": {
+        "season": "Kharif (Jun–Sep)", "water": "500–800 mm", "soil": "Well-drained loam",
+        "price": "Rs 1,962/quintal", "diseases": "Stalk rot, Leaf blight, Smut",
+        "emoji": "🌽", "color": "#f97316",
+        "nutrition": {"Calories": "365 kcal", "Protein": "9g", "Carbs": "74g", "Fiber": "7g", "Fat": "4g"},
+        "diet_uses": ["Corn flour", "Popcorn", "Cornmeal", "Makki roti", "Animal feed"],
+        "health_benefits": "Rich in antioxidants, supports eye health, good source of energy and fibre.",
+        "locations": [
+            {"state": "Karnataka", "lat": 15.3173, "lon": 75.7139},
+            {"state": "Andhra Pradesh", "lat": 15.9129, "lon": 79.7400},
+            {"state": "Maharashtra", "lat": 19.7515, "lon": 75.7139},
+            {"state": "Rajasthan", "lat": 27.0238, "lon": 74.2179},
+            {"state": "Madhya Pradesh", "lat": 22.9734, "lon": 78.6569},
+        ],
+    },
+    "mango": {
+        "season": "Summer (Mar–Jun)", "water": "750–1,500 mm", "soil": "Loamy / Alluvial",
+        "price": "Rs 2,000–8,000/quintal", "diseases": "Powdery mildew, Anthracnose, Mango malformation",
+        "emoji": "🥭", "color": "#f59e0b",
+        "nutrition": {"Calories": "60 kcal", "Protein": "0.8g", "Carbs": "15g", "Fiber": "1.6g", "Fat": "0.4g"},
+        "diet_uses": ["Fresh fruit", "Mango juice", "Aamras", "Pickles (Aam ka achar)", "Mango lassi", "Chutney"],
+        "health_benefits": "Rich in Vitamin C and A, boosts immunity, aids digestion, high in antioxidants, supports eye health.",
+        "locations": [
+            {"state": "Uttar Pradesh", "lat": 26.8467, "lon": 80.9462},
+            {"state": "Andhra Pradesh", "lat": 15.9129, "lon": 79.7400},
+            {"state": "Karnataka", "lat": 15.3173, "lon": 75.7139},
+            {"state": "Bihar", "lat": 25.0961, "lon": 85.3131},
+            {"state": "Gujarat", "lat": 22.2587, "lon": 71.1924},
+        ],
+    },
+    "banana": {
+        "season": "Year-round", "water": "1,200–2,200 mm", "soil": "Rich loamy",
+        "price": "Rs 1,500–2,500/quintal", "diseases": "Panama wilt, Sigatoka, Bunchy top",
+        "emoji": "🍌", "color": "#eab308",
+        "nutrition": {"Calories": "89 kcal", "Protein": "1g", "Carbs": "23g", "Fiber": "2.6g", "Fat": "0.3g"},
+        "diet_uses": ["Eaten raw", "Smoothies", "Banana chips", "Baby food", "Halwa"],
+        "health_benefits": "Rich in potassium, supports heart health, boosts energy, aids digestion.",
+        "locations": [
+            {"state": "Tamil Nadu", "lat": 11.1271, "lon": 78.6569},
+            {"state": "Maharashtra", "lat": 19.7515, "lon": 75.7139},
+            {"state": "Gujarat", "lat": 22.2587, "lon": 71.1924},
+            {"state": "Andhra Pradesh", "lat": 15.9129, "lon": 79.7400},
+            {"state": "Karnataka", "lat": 15.3173, "lon": 75.7139},
+        ],
+    },
+    "tomato": {
+        "season": "Oct–Feb", "water": "400–600 mm", "soil": "Sandy loam",
+        "price": "Rs 800–2,000/quintal", "diseases": "Early blight, Fusarium wilt, Mosaic virus",
+        "emoji": "🍅", "color": "#ef4444",
+        "nutrition": {"Calories": "18 kcal", "Protein": "0.9g", "Carbs": "3.9g", "Fiber": "1.2g", "Fat": "0.2g"},
+        "diet_uses": ["Salads", "Sauces", "Soups", "Ketchup", "Curries"],
+        "health_benefits": "Rich in lycopene, supports heart health, high in Vitamin C, low calorie.",
+        "locations": [
+            {"state": "Maharashtra", "lat": 19.7515, "lon": 75.7139},
+            {"state": "Karnataka", "lat": 15.3173, "lon": 75.7139},
+            {"state": "Andhra Pradesh", "lat": 15.9129, "lon": 79.7400},
+            {"state": "Tamil Nadu", "lat": 11.1271, "lon": 78.6569},
+            {"state": "Odisha", "lat": 20.9517, "lon": 85.0985},
+        ],
+    },
+    "cotton": {
+        "season": "Kharif (May–Dec)", "water": "700–1,200 mm", "soil": "Black cotton soil",
+        "price": "Rs 6,620/quintal", "diseases": "Bollworm, Fusarium wilt, Leaf curl",
+        "emoji": "🌸", "color": "#8b5cf6",
+        "nutrition": {"Calories": "N/A", "Protein": "N/A", "Carbs": "N/A", "Fiber": "N/A", "Fat": "N/A"},
+        "diet_uses": ["Cottonseed oil (cooking)", "Cottonseed meal (animal feed)", "Fibre crop"],
+        "health_benefits": "Cottonseed oil is used in cooking. Primarily a fibre and textile crop.",
+        "locations": [
+            {"state": "Gujarat", "lat": 22.2587, "lon": 71.1924},
+            {"state": "Maharashtra", "lat": 19.7515, "lon": 75.7139},
+            {"state": "Telangana", "lat": 18.1124, "lon": 79.0193},
+            {"state": "Andhra Pradesh", "lat": 15.9129, "lon": 79.7400},
+            {"state": "Punjab", "lat": 31.1471, "lon": 75.3412},
+        ],
+    },
+    "sugarcane": {
+        "season": "Year-round (12–18 months)", "water": "1,500–2,500 mm", "soil": "Deep loam",
+        "price": "Rs 315/quintal", "diseases": "Red rot, Smut, Wilt",
+        "emoji": "🎋", "color": "#84cc16",
+        "nutrition": {"Calories": "269 kcal", "Protein": "0g", "Carbs": "73g", "Fiber": "0g", "Fat": "0g"},
+        "diet_uses": ["Sugar", "Jaggery", "Molasses", "Sugarcane juice", "Rum"],
+        "health_benefits": "Quick energy boost, natural electrolytes, aids liver function.",
+        "locations": [
+            {"state": "Uttar Pradesh", "lat": 26.8467, "lon": 80.9462},
+            {"state": "Maharashtra", "lat": 19.7515, "lon": 75.7139},
+            {"state": "Karnataka", "lat": 15.3173, "lon": 75.7139},
+            {"state": "Tamil Nadu", "lat": 11.1271, "lon": 78.6569},
+            {"state": "Andhra Pradesh", "lat": 15.9129, "lon": 79.7400},
+        ],
+    },
+    "tea": {
+        "season": "Year-round", "water": "1,500–2,500 mm", "soil": "Acidic loam",
+        "price": "Rs 200–500/kg", "diseases": "Blister blight, Red spider mite, Root rot",
+        "emoji": "🍵", "color": "#059669",
+        "nutrition": {"Calories": "1 kcal", "Protein": "0g", "Carbs": "0.2g", "Fiber": "0g", "Fat": "0g"},
+        "diet_uses": ["Black tea", "Green tea", "Chai", "Herbal infusions", "Iced tea"],
+        "health_benefits": "Rich in antioxidants, boosts alertness, supports heart health, anti-inflammatory.",
+        "locations": [
+            {"state": "Assam", "lat": 26.2006, "lon": 92.9376},
+            {"state": "West Bengal", "lat": 22.9868, "lon": 87.8550},
+            {"state": "Tamil Nadu", "lat": 11.1271, "lon": 78.6569},
+            {"state": "Kerala", "lat": 10.8505, "lon": 76.2711},
+            {"state": "Himachal Pradesh", "lat": 31.1048, "lon": 77.1734},
+        ],
+    },
+    "coconut": {
+        "season": "Year-round", "water": "1,000–2,000 mm", "soil": "Sandy loam / Laterite",
+        "price": "Rs 25–40/nut", "diseases": "Bud rot, Root wilt, Eriophyid mite",
+        "emoji": "🥥", "color": "#92400e",
+        "nutrition": {"Calories": "354 kcal", "Protein": "3g", "Carbs": "15g", "Fiber": "9g", "Fat": "33g"},
+        "diet_uses": ["Coconut oil", "Coconut milk", "Chutney", "Curries", "Coconut water"],
+        "health_benefits": "Healthy fats, boosts immunity, supports brain function, hydrating.",
+        "locations": [
+            {"state": "Kerala", "lat": 10.8505, "lon": 76.2711},
+            {"state": "Karnataka", "lat": 15.3173, "lon": 75.7139},
+            {"state": "Tamil Nadu", "lat": 11.1271, "lon": 78.6569},
+            {"state": "Andhra Pradesh", "lat": 15.9129, "lon": 79.7400},
+            {"state": "Odisha", "lat": 20.9517, "lon": 85.0985},
+        ],
+    },
+    "chilli": {
+        "season": "Kharif & Rabi", "water": "600–1,250 mm", "soil": "Loam / Clay loam",
+        "price": "Rs 5,000–15,000/quintal", "diseases": "Anthracnose, Mosaic virus, Damping-off",
+        "emoji": "🌶️", "color": "#dc2626",
+        "nutrition": {"Calories": "40 kcal", "Protein": "2g", "Carbs": "9g", "Fiber": "1.5g", "Fat": "0.4g"},
+        "diet_uses": ["Spice in curries", "Chilli powder", "Pickles", "Sauces", "Chutneys"],
+        "health_benefits": "Boosts metabolism, pain relief, rich in Vitamin C, anti-inflammatory.",
+        "locations": [
+            {"state": "Andhra Pradesh", "lat": 15.9129, "lon": 79.7400},
+            {"state": "Telangana", "lat": 18.1124, "lon": 79.0193},
+            {"state": "Karnataka", "lat": 15.3173, "lon": 75.7139},
+            {"state": "Maharashtra", "lat": 19.7515, "lon": 75.7139},
+            {"state": "Odisha", "lat": 20.9517, "lon": 85.0985},
+        ],
+    },
+    "sunflower": {
+        "season": "Kharif & Rabi", "water": "500–700 mm", "soil": "Well-drained loam",
+        "price": "Rs 6,015/quintal", "diseases": "Downy mildew, Alternaria blight, Rust",
+        "emoji": "🌻", "color": "#fbbf24",
+        "nutrition": {"Calories": "584 kcal", "Protein": "21g", "Carbs": "20g", "Fiber": "9g", "Fat": "51g"},
+        "diet_uses": ["Sunflower oil", "Sunflower seeds", "Snacks", "Salad toppings", "Butter"],
+        "health_benefits": "Rich in Vitamin E, lowers cholesterol, anti-inflammatory, heart healthy.",
+        "locations": [
+            {"state": "Karnataka", "lat": 15.3173, "lon": 75.7139},
+            {"state": "Andhra Pradesh", "lat": 15.9129, "lon": 79.7400},
+            {"state": "Maharashtra", "lat": 19.7515, "lon": 75.7139},
+            {"state": "Bihar", "lat": 25.0961, "lon": 85.3131},
+            {"state": "Odisha", "lat": 20.9517, "lon": 85.0985},
+        ],
+    },
+    "mustard": {
+        "season": "Rabi (Oct–Mar)", "water": "250–400 mm", "soil": "Loam / Sandy loam",
+        "price": "Rs 5,650/quintal", "diseases": "White rust, Alternaria blight, Sclerotinia rot",
+        "emoji": "🌼", "color": "#d97706",
+        "nutrition": {"Calories": "508 kcal", "Protein": "26g", "Carbs": "28g", "Fiber": "12g", "Fat": "36g"},
+        "diet_uses": ["Mustard oil (cooking)", "Pickles", "Mustard sauce", "Tempering spice", "Mustard greens (saag)"],
+        "health_benefits": "Omega-3 rich, anti-bacterial, boosts immunity, heart friendly oil.",
+        "locations": [
+            {"state": "Rajasthan", "lat": 27.0238, "lon": 74.2179},
+            {"state": "Uttar Pradesh", "lat": 26.8467, "lon": 80.9462},
+            {"state": "Haryana", "lat": 29.0588, "lon": 76.0856},
+            {"state": "Madhya Pradesh", "lat": 22.9734, "lon": 78.6569},
+            {"state": "West Bengal", "lat": 22.9868, "lon": 87.8550},
+        ],
+    },
+    "mustard-oil": {
+        "season": "Rabi (Oct–Mar)", "water": "250–400 mm", "soil": "Loam / Sandy loam",
+        "price": "Rs 5,650/quintal", "diseases": "White rust, Alternaria blight, Sclerotinia rot",
+        "emoji": "🌼", "color": "#d97706",
+        "nutrition": {"Calories": "884 kcal", "Protein": "0g", "Carbs": "0g", "Fiber": "0g", "Fat": "100g"},
+        "diet_uses": ["Mustard oil (cooking)", "Pickles", "Mustard sauce", "Tempering spice"],
+        "health_benefits": "Omega-3 rich, anti-bacterial, boosts immunity, heart friendly oil.",
+        "locations": [
+            {"state": "Rajasthan", "lat": 27.0238, "lon": 74.2179},
+            {"state": "Uttar Pradesh", "lat": 26.8467, "lon": 80.9462},
+            {"state": "Haryana", "lat": 29.0588, "lon": 76.0856},
+            {"state": "Madhya Pradesh", "lat": 22.9734, "lon": 78.6569},
+            {"state": "West Bengal", "lat": 22.9868, "lon": 87.8550},
+        ],
+    },
+    "soyabean": {
+        "season": "Kharif (Jun–Oct)", "water": "450–700 mm", "soil": "Well-drained loam",
+        "price": "Rs 4,600/quintal", "diseases": "Rust, Mosaic virus, Root rot",
+        "emoji": "🫘", "color": "#65a30d",
+        "nutrition": {"Calories": "446 kcal", "Protein": "36g", "Carbs": "30g", "Fiber": "9g", "Fat": "20g"},
+        "diet_uses": ["Tofu", "Soy milk", "Soybean oil", "Tempeh", "Protein supplements"],
+        "health_benefits": "Complete protein source, lowers cholesterol, rich in iron and calcium.",
+        "locations": [
+            {"state": "Madhya Pradesh", "lat": 22.9734, "lon": 78.6569},
+            {"state": "Maharashtra", "lat": 19.7515, "lon": 75.7139},
+            {"state": "Rajasthan", "lat": 27.0238, "lon": 74.2179},
+            {"state": "Karnataka", "lat": 15.3173, "lon": 75.7139},
+            {"state": "Telangana", "lat": 18.1124, "lon": 79.0193},
+        ],
+    },
+    "jowar": {
+        "season": "Kharif (Jun–Sep)", "water": "400–600 mm", "soil": "Medium deep black",
+        "price": "Rs 3,180/quintal", "diseases": "Downy mildew, Anthracnose, Rust",
+        "emoji": "🌿", "color": "#78716c",
+        "nutrition": {"Calories": "329 kcal", "Protein": "11g", "Carbs": "72g", "Fiber": "6g", "Fat": "3g"},
+        "diet_uses": ["Jowar roti", "Porridge", "Flour", "Animal feed", "Gluten-free baking"],
+        "health_benefits": "Gluten-free, controls blood sugar, rich in antioxidants, high fibre.",
+        "locations": [
+            {"state": "Maharashtra", "lat": 19.7515, "lon": 75.7139},
+            {"state": "Karnataka", "lat": 15.3173, "lon": 75.7139},
+            {"state": "Andhra Pradesh", "lat": 15.9129, "lon": 79.7400},
+            {"state": "Madhya Pradesh", "lat": 22.9734, "lon": 78.6569},
+            {"state": "Rajasthan", "lat": 27.0238, "lon": 74.2179},
+        ],
+    },
+    "jute": {
+        "season": "Kharif (Mar–Jul)", "water": "1,000–2,000 mm", "soil": "Alluvial loam",
+        "price": "Rs 5,050/quintal", "diseases": "Stem rot, Root knot, Anthracnose",
+        "emoji": "🧵", "color": "#a16207",
+        "nutrition": {"Calories": "35 kcal", "Protein": "3.6g", "Carbs": "6.4g", "Fiber": "2g", "Fat": "0.1g"},
+        "diet_uses": ["Jute leaves cooked as greens", "Fibre crop primarily", "Jute leaf soup"],
+        "health_benefits": "Jute leaves are rich in iron, calcium, and vitamins, used as a leafy vegetable.",
+        "locations": [
+            {"state": "West Bengal", "lat": 22.9868, "lon": 87.8550},
+            {"state": "Bihar", "lat": 25.0961, "lon": 85.3131},
+            {"state": "Assam", "lat": 26.2006, "lon": 92.9376},
+            {"state": "Odisha", "lat": 20.9517, "lon": 85.0985},
+            {"state": "Meghalaya", "lat": 25.4670, "lon": 91.3662},
+        ],
+    },
+    "coffee": {
+        "season": "Year-round", "water": "1,500–2,500 mm", "soil": "Laterite / Forest loam",
+        "price": "Rs 200–400/kg", "diseases": "Leaf rust, Berry borer, Root rot",
+        "emoji": "☕", "color": "#78350f",
+        "nutrition": {"Calories": "2 kcal", "Protein": "0.3g", "Carbs": "0g", "Fiber": "0g", "Fat": "0g"},
+        "diet_uses": ["Black coffee", "Espresso", "Cappuccino", "Coffee powder", "Flavouring"],
+        "health_benefits": "Boosts alertness, rich in antioxidants, improves physical performance.",
+        "locations": [
+            {"state": "Karnataka", "lat": 15.3173, "lon": 75.7139},
+            {"state": "Kerala", "lat": 10.8505, "lon": 76.2711},
+            {"state": "Tamil Nadu", "lat": 11.1271, "lon": 78.6569},
+        ],
+    },
+    "coffee-plant": {
+        "season": "Year-round", "water": "1,500–2,500 mm", "soil": "Laterite / Forest loam",
+        "price": "Rs 200–400/kg", "diseases": "Leaf rust, Berry borer, Root rot",
+        "emoji": "☕", "color": "#78350f",
+        "nutrition": {"Calories": "2 kcal", "Protein": "0.3g", "Carbs": "0g", "Fiber": "0g", "Fat": "0g"},
+        "diet_uses": ["Black coffee", "Espresso", "Cappuccino", "Coffee powder", "Flavouring"],
+        "health_benefits": "Boosts alertness, rich in antioxidants, improves physical performance.",
+        "locations": [
+            {"state": "Karnataka", "lat": 15.3173, "lon": 75.7139},
+            {"state": "Kerala", "lat": 10.8505, "lon": 76.2711},
+            {"state": "Tamil Nadu", "lat": 11.1271, "lon": 78.6569},
+        ],
+    },
+    "gram": {
+        "season": "Rabi (Oct–Mar)", "water": "300–400 mm", "soil": "Sandy loam / Loam",
+        "price": "Rs 5,440/quintal", "diseases": "Wilt, Blight, Root rot",
+        "emoji": "🫘", "color": "#713f12",
+        "nutrition": {"Calories": "364 kcal", "Protein": "19g", "Carbs": "61g", "Fiber": "17g", "Fat": "6g"},
+        "diet_uses": ["Dal", "Besan flour", "Chana masala", "Hummus", "Snacks"],
+        "health_benefits": "High protein, controls blood sugar, supports digestion, rich in iron.",
+        "locations": [
+            {"state": "Madhya Pradesh", "lat": 22.9734, "lon": 78.6569},
+            {"state": "Rajasthan", "lat": 27.0238, "lon": 74.2179},
+            {"state": "Maharashtra", "lat": 19.7515, "lon": 75.7139},
+            {"state": "Uttar Pradesh", "lat": 26.8467, "lon": 80.9462},
+            {"state": "Karnataka", "lat": 15.3173, "lon": 75.7139},
+        ],
+    },
+    "lemon": {
+        "season": "Year-round", "water": "750–1,200 mm", "soil": "Sandy loam",
+        "price": "Rs 30–60/kg", "diseases": "Canker, Tristeza virus, Phytophthora",
+        "emoji": "🍋", "color": "#ca8a04",
+        "nutrition": {"Calories": "29 kcal", "Protein": "1g", "Carbs": "9g", "Fiber": "2.8g", "Fat": "0.3g"},
+        "diet_uses": ["Lemonade", "Salad dressing", "Pickling", "Cooking", "Tea flavouring"],
+        "health_benefits": "Very high in Vitamin C, boosts immunity, aids digestion, alkalises body.",
+        "locations": [
+            {"state": "Andhra Pradesh", "lat": 15.9129, "lon": 79.7400},
+            {"state": "Maharashtra", "lat": 19.7515, "lon": 75.7139},
+            {"state": "Tamil Nadu", "lat": 11.1271, "lon": 78.6569},
+            {"state": "Gujarat", "lat": 22.2587, "lon": 71.1924},
+        ],
+    },
+    "papaya": {
+        "season": "Year-round", "water": "1,500–2,000 mm", "soil": "Sandy loam / Alluvial",
+        "price": "Rs 15–40/kg", "diseases": "Ring spot virus, Damping off, Anthracnose",
+        "emoji": "🧡", "color": "#ea580c",
+        "nutrition": {"Calories": "43 kcal", "Protein": "0.5g", "Carbs": "11g", "Fiber": "1.7g", "Fat": "0.3g"},
+        "diet_uses": ["Fresh fruit", "Juices", "Salads", "Jam", "Papaya halwa"],
+        "health_benefits": "Rich in papain enzyme, aids digestion, high in Vitamin C and A.",
+        "locations": [
+            {"state": "Andhra Pradesh", "lat": 15.9129, "lon": 79.7400},
+            {"state": "Karnataka", "lat": 15.3173, "lon": 75.7139},
+            {"state": "Gujarat", "lat": 22.2587, "lon": 71.1924},
+            {"state": "Maharashtra", "lat": 19.7515, "lon": 75.7139},
+        ],
+    },
+    "pineapple": {
+        "season": "Year-round", "water": "1,000–1,500 mm", "soil": "Sandy loam / Laterite",
+        "price": "Rs 20–50/kg", "diseases": "Heart rot, Root rot, Mealybug wilt",
+        "emoji": "🍍", "color": "#d97706",
+        "nutrition": {"Calories": "50 kcal", "Protein": "0.5g", "Carbs": "13g", "Fiber": "1.4g", "Fat": "0.1g"},
+        "diet_uses": ["Fresh fruit", "Juice", "Jam", "Canned fruit", "Smoothies"],
+        "health_benefits": "Contains bromelain enzyme, boosts immunity, anti-inflammatory, aids digestion.",
+        "locations": [
+            {"state": "Assam", "lat": 26.2006, "lon": 92.9376},
+            {"state": "West Bengal", "lat": 22.9868, "lon": 87.8550},
+            {"state": "Kerala", "lat": 10.8505, "lon": 76.2711},
+            {"state": "Karnataka", "lat": 15.3173, "lon": 75.7139},
+        ],
+    },
+    "apple": {
+        "season": "Summer-Autumn (Jul-Oct)", "water": "1,000-1,250 mm", "soil": "Well-drained loam",
+        "price": "Rs 50-150/kg", "diseases": "Scab, Fire blight, Powdery mildew",
+        "emoji": "🍎", "color": "#ef4444",
+        "nutrition": {"Calories": "52 kcal", "Protein": "0.3g", "Carbs": "14g", "Fiber": "2.4g", "Fat": "0.2g"},
+        "diet_uses": ["Fresh fruit", "Apple juice", "Apple cider", "Jam", "Dried apple"],
+        "health_benefits": "High in fibre, rich in antioxidants, supports heart health, controls blood sugar.",
+        "locations": [
+            {"state": "Himachal Pradesh", "lat": 31.1048, "lon": 77.1734},
+            {"state": "Jammu & Kashmir", "lat": 34.0836, "lon": 74.7973},
+            {"state": "Uttarakhand", "lat": 30.0668, "lon": 79.0193},
+        ],
+    },
+    "grapes": {
+        "season": "Jan-May", "water": "700-1,200 mm", "soil": "Sandy loam / Loam",
+        "price": "Rs 40-150/kg", "diseases": "Downy mildew, Powdery mildew, Anthracnose",
+        "emoji": "🍇", "color": "#7c3aed",
+        "nutrition": {"Calories": "67 kcal", "Protein": "0.6g", "Carbs": "17g", "Fiber": "0.9g", "Fat": "0.4g"},
+        "diet_uses": ["Fresh fruit", "Raisins", "Wine", "Grape juice", "Jam"],
+        "health_benefits": "Rich in resveratrol, supports heart health, anti-inflammatory, boosts immunity.",
+        "locations": [
+            {"state": "Maharashtra", "lat": 19.7515, "lon": 75.7139},
+            {"state": "Karnataka", "lat": 15.3173, "lon": 75.7139},
+            {"state": "Andhra Pradesh", "lat": 15.9129, "lon": 79.7400},
+            {"state": "Tamil Nadu", "lat": 11.1271, "lon": 78.6569},
+        ],
+    },
+    "onion": {
+        "season": "Rabi (Oct-Mar)", "water": "350-550 mm", "soil": "Sandy loam / Loam",
+        "price": "Rs 800-3,000/quintal", "diseases": "Purple blotch, Stemphylium blight, Basal rot",
+        "emoji": "🧅", "color": "#d97706",
+        "nutrition": {"Calories": "40 kcal", "Protein": "1.1g", "Carbs": "9g", "Fiber": "1.7g", "Fat": "0.1g"},
+        "diet_uses": ["Curries", "Salads", "Pickles", "Soups", "Fried onion"],
+        "health_benefits": "Rich in quercetin, anti-inflammatory, supports heart health, boosts immunity.",
+        "locations": [
+            {"state": "Maharashtra", "lat": 19.7515, "lon": 75.7139},
+            {"state": "Karnataka", "lat": 15.3173, "lon": 75.7139},
+            {"state": "Madhya Pradesh", "lat": 22.9734, "lon": 78.6569},
+            {"state": "Gujarat", "lat": 22.2587, "lon": 71.1924},
+            {"state": "Rajasthan", "lat": 27.0238, "lon": 74.2179},
+        ],
+    },
+    "potato": {
+        "season": "Rabi (Oct-Mar)", "water": "500-700 mm", "soil": "Sandy loam / Loam",
+        "price": "Rs 800-2,000/quintal", "diseases": "Late blight, Early blight, Common scab",
+        "emoji": "🥔", "color": "#a16207",
+        "nutrition": {"Calories": "77 kcal", "Protein": "2g", "Carbs": "17g", "Fiber": "2.2g", "Fat": "0.1g"},
+        "diet_uses": ["Curry", "Chips", "Fries", "Boiled", "Stuffed paratha"],
+        "health_benefits": "Good source of Vitamin C and B6, rich in potassium, supports energy metabolism.",
+        "locations": [
+            {"state": "Uttar Pradesh", "lat": 26.8467, "lon": 80.9462},
+            {"state": "West Bengal", "lat": 22.9868, "lon": 87.8550},
+            {"state": "Bihar", "lat": 25.0961, "lon": 85.3131},
+            {"state": "Punjab", "lat": 31.1471, "lon": 75.3412},
+            {"state": "Gujarat", "lat": 22.2587, "lon": 71.1924},
+        ],
+    },
 }
-for k, v in defaults.items():
-    if k not in st.session_state:
-        st.session_state[k] = v
 
-# ══════════════════════════════════════════════
-#  PREDICTION BARS
-# ══════════════════════════════════════════════
-def render_pred_bars(top5):
-    colors = ["#1a5c35","#2e8b57","#3aad6e","#52c788","#74d9a0"]
-    medals = ["🥇","🥈","🥉","4️⃣","5️⃣"]
-    html   = "<div style='margin-top:8px'>"
-    for i, (name, pct) in enumerate(top5):
-        c = colors[i]
-        html += f"""
-        <div class='pred-bar-wrap'>
-          <div class='pred-bar-label'>
-            <span>{medals[i]}&nbsp;<b>{name}</b></span>
-            <span style='color:{c};font-weight:700'>{pct}%</span>
-          </div>
-          <div class='pred-bar-bg'>
-            <div class='pred-bar-fill' style='width:{min(pct,100)}%;background:{c};'></div>
-          </div>
-        </div>"""
-    html += "</div>"
-    st.markdown(html, unsafe_allow_html=True)
+# ── ALIAS MAP ─────────────────────────────────────────────────────────────────
+CROP_ALIASES = {
+    "mango tree": "mango", "alphonso": "mango", "dasheri": "mango", "langra": "mango",
+    "corn": "maize", "soybean": "soyabean", "soy": "soyabean", "soybeans": "soyabean",
+    "chilly": "chilli", "chili": "chilli", "pepper": "chilli",
+    "coffee plant": "coffee", "coffee-plant": "coffee",
+    "mustard oil": "mustard", "mustard plant": "mustard", "rapeseed": "mustard",
+    "sugarcane plant": "sugarcane", "sugar cane": "sugarcane",
+    "paddy": "rice", "paddy rice": "rice",
+    "jowar sorghum": "jowar", "sorghum": "jowar",
+    "groundnut": "gram", "chickpea": "gram", "bengal gram": "gram",
+    "lemon tree": "lemon", "citrus": "lemon",
+    "banana plant": "banana", "plantain": "banana",
+    "coconut tree": "coconut", "coconut palm": "coconut",
+    "tomatoes": "tomato", "onions": "onion", "potatoes": "potato",
+    "grapes vine": "grapes", "grape": "grapes",
+    "wheat plant": "wheat", "rice plant": "rice",
+}
 
-# ══════════════════════════════════════════════
-#  SIDEBAR
-# ══════════════════════════════════════════════
-with st.sidebar:
-    st.markdown("## 🌿 CropID")
-    st.markdown("**AI-Powered Crop Identification & Nutrition System**")
-    st.markdown("---")
-    st.markdown("### How to Use")
-    st.markdown("1. 📸 Upload / URL / Webcam\n2. 🚀 Click **Identify**\n3. 📋 View report\n4. 💬 Ask chatbot")
-    st.markdown("---")
-    st.markdown("### 🤖 Identification Mode")
-    st.markdown("**Primary:** Groq Vision AI *(very accurate)*")
-    st.markdown("**Backup:** Local ML Model")
-    st.markdown("---")
-    st.markdown("### Supported Crops")
-    for c in crop_labels:
-        st.markdown(f"- {c}")
-    st.markdown("---")
-    st.caption("TensorFlow · Groq LLaMA · Streamlit")
 
-# ══════════════════════════════════════════════
-#  HEADER
-# ══════════════════════════════════════════════
-st.markdown("""
-<div style='text-align:center;padding:10px 0 20px'>
-  <h1 style='font-family:Syne,sans-serif;font-size:2.4rem;
-    background:linear-gradient(135deg,#1a5c35,#2e8b57);
-    -webkit-background-clip:text;-webkit-text-fill-color:transparent;margin-bottom:4px;'>
-    🌿 CropID Multimodal System
-  </h1>
-  <p style='color:#555;font-size:1rem;'>
-    Identify any crop from a photo — get a full nutrition &amp; diet report
-  </p>
-</div>
-""", unsafe_allow_html=True)
+def get_crop_info(crop_name):
+    name = crop_name.lower().strip()
+    if name in CROP_INFO:
+        return CROP_INFO[name], name
+    if name in CROP_ALIASES:
+        key = CROP_ALIASES[name]
+        return CROP_INFO[key], key
+    for k in CROP_INFO:
+        if k in name or name in k:
+            return CROP_INFO[k], k
+    for alias, key in CROP_ALIASES.items():
+        if alias in name or name in alias:
+            return CROP_INFO[key], key
+    fallback = {
+        "season": "Varies by region", "water": "Moderate", "soil": "Well-drained loam",
+        "price": "Market dependent", "diseases": "Consult local expert",
+        "emoji": "🌱", "color": "#10b981",
+        "nutrition": {"Calories": "—", "Protein": "—", "Carbs": "—", "Fiber": "—", "Fat": "—"},
+        "diet_uses": [f"Refer to local agricultural guide for {crop_name.title()}"],
+        "health_benefits": f"No specific data found for {crop_name.title()}. Consult a nutritionist.",
+        "locations": [{"state": "India", "lat": 20.5937, "lon": 78.9629}],
+    }
+    return fallback, crop_name
 
-# ══════════════════════════════════════════════
-#  MAIN LAYOUT
-# ══════════════════════════════════════════════
-col_left, col_right = st.columns([1.2, 1], gap="large")
 
-with col_left:
-    st.markdown("### 📤 Upload Your Crop Image")
-    source = st.radio("Source:", ["Upload File", "Image URL", "Webcam"],
-                      horizontal=True, label_visibility="collapsed")
+def inject_css():
+    st.markdown("""
+    <style>
+    @import url('https://fonts.googleapis.com/css2?family=Syne:wght@400;700;800&family=DM+Sans:wght@300;400;500&display=swap');
+    html,body,.stApp{background:#f8fafc!important;font-family:'DM Sans',sans-serif;color:#1e293b;}
+    .stApp>header{background:transparent!important;}
+    section[data-testid="stSidebar"]{background:#f0fdf4!important;border-right:2px solid #bbf7d0;}
+    .hero{background:linear-gradient(135deg,#dcfce7,#ede9fe);border:1px solid #bbf7d0;
+          border-radius:20px;padding:2.5rem 3rem;margin-bottom:1.5rem;text-align:center;}
+    .hero h1{font-family:'Syne',sans-serif;font-size:3rem;font-weight:800;
+             background:linear-gradient(135deg,#16a34a,#6366f1);
+             -webkit-background-clip:text;-webkit-text-fill-color:transparent;margin:0;}
+    .hero p{color:#64748b;font-size:1.05rem;margin:.4rem 0 0;}
+    .info-card{background:#fff;border:1px solid #e2e8f0;border-radius:16px;padding:1.4rem;
+               margin:.5rem 0;box-shadow:0 1px 6px #0000000a;transition:transform .2s,box-shadow .2s;}
+    .info-card:hover{transform:translateY(-2px);box-shadow:0 6px 20px #16a34a18;}
+    .result-card{background:linear-gradient(135deg,#dcfce7,#ede9fe);border:2px solid #16a34a;
+                 border-radius:20px;padding:2rem;text-align:center;margin:1rem 0;}
+    .result-card h2{font-family:'Syne',sans-serif;font-size:2.4rem;font-weight:800;color:#16a34a;margin:0;}
+    .stat-pill{display:inline-block;background:#dcfce7;border:1px solid #86efac;border-radius:999px;
+               padding:.3rem .85rem;font-size:.78rem;color:#15803d;margin:.2rem;font-weight:500;}
+    .conf-bar-wrap{background:#e2e8f0;border-radius:999px;height:10px;overflow:hidden;margin:.35rem 0;}
+    .conf-bar{height:100%;border-radius:999px;background:linear-gradient(90deg,#16a34a,#6366f1);}
+    .top3-item{background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:.75rem 1rem;
+               margin:.35rem 0;display:flex;align-items:center;gap:.75rem;box-shadow:0 1px 4px #0000000a;}
+    .top3-rank{font-family:'Syne',sans-serif;font-size:1.3rem;font-weight:800;color:#16a34a;width:2rem;}
+    .top3-name{flex:1;font-weight:500;color:#1e293b;}
+    .top3-pct{color:#6366f1;font-weight:700;font-family:'Syne',sans-serif;}
+    .section-title{font-family:'Syne',sans-serif;font-size:1.2rem;font-weight:700;color:#1e293b;
+                   border-left:4px solid #16a34a;padding-left:.75rem;margin:1.5rem 0 1rem;}
+    .chat-user{background:#ede9fe;border:1px solid #c4b5fd;border-radius:16px 16px 4px 16px;
+               padding:.75rem 1rem;margin:.4rem 0;color:#1e293b;}
+    .chat-bot{background:#dcfce7;border:1px solid #86efac;border-radius:16px 16px 16px 4px;
+              padding:.75rem 1rem;margin:.4rem 0;color:#1e293b;}
+    .nut-grid{display:grid;grid-template-columns:repeat(5,1fr);gap:.6rem;margin:.8rem 0;}
+    .nut-box{background:#f0fdf4;border:1px solid #bbf7d0;border-radius:12px;padding:.8rem .4rem;text-align:center;}
+    .nut-val{font-family:'Syne',sans-serif;font-size:1.1rem;font-weight:700;color:#15803d;}
+    .nut-lbl{font-size:.7rem;color:#64748b;margin-top:.2rem;}
+    .use-pill{display:inline-block;background:#ede9fe;border:1px solid #c4b5fd;border-radius:999px;
+              padding:.25rem .8rem;font-size:.8rem;color:#4f46e5;margin:.2rem;font-weight:500;}
+    .benefit-box{background:#f0fdf4;border-left:4px solid #16a34a;border-radius:10px;
+                 padding:.9rem 1rem;margin-top:.8rem;}
+    #MainMenu,footer,.stDeployButton{display:none!important;}
+    .block-container{padding-top:1.5rem!important;}
+    .stButton>button{background:linear-gradient(135deg,#16a34a,#6366f1)!important;color:white!important;
+                     border:none!important;border-radius:12px!important;font-family:'DM Sans',sans-serif!important;
+                     font-weight:500!important;padding:.5rem 1.5rem!important;}
+    .stButton>button:hover{opacity:.85!important;}
+    </style>
+    """, unsafe_allow_html=True)
 
-    img = None
 
-    if source == "Upload File":
-        f = st.file_uploader("Upload", type=['jpg','jpeg','png','webp'],
-                             label_visibility="collapsed")
+@st.cache_resource
+def load_model():
+    if not TF_AVAILABLE:
+        return None, []
+    try:
+        model = tf.keras.models.load_model("crop_model.h5")
+        with open("labels.txt") as f:
+            labels = [l.strip() for l in f.readlines()]
+        return model, labels
+    except Exception:
+        return None, []
+
+
+@st.cache_resource
+def get_groq():
+    key = os.getenv("GROQ_API_KEY", "")
+    return Groq(api_key=key) if key else None
+
+
+def enhance_image(img):
+    return ImageEnhance.Contrast(ImageEnhance.Sharpness(img).enhance(1.5)).enhance(1.2)
+
+
+def preprocess(img):
+    img = img.convert("RGB").resize((224, 224))
+    return np.expand_dims(np.array(img) / 255.0, 0)
+
+
+def predict_local(img, model, labels):
+    preds = model.predict(preprocess(img), verbose=0)[0]
+    top3_idx = preds.argsort()[-3:][::-1]
+    return [(labels[i], float(preds[i]) * 100) for i in top3_idx]
+
+
+def predict_groq(img, client):
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG")
+    b64 = base64.b64encode(buf.getvalue()).decode()
+    try:
+        resp = client.chat.completions.create(
+            model="meta-llama/llama-4-scout-17b-16e-instruct",
+            messages=[{"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+                {"type": "text", "text": (
+                    'Identify the crop or plant in the image. '
+                    'Reply ONLY with valid JSON: '
+                    '{"crop":"mango","confidence":92,"alternatives":[{"crop":"papaya","confidence":5},{"crop":"banana","confidence":3}],"note":"one line observation"}. '
+                    'Use common English crop names (e.g. mango, wheat, rice, tomato). '
+                    'No markdown, no extra text.'
+                )},
+            ]}],
+            max_tokens=250,
+        )
+        raw = resp.choices[0].message.content.strip().replace("```json", "").replace("```", "").strip()
+        data = json.loads(raw)
+        top3 = [(data["crop"], data["confidence"])]
+        for alt in data.get("alternatives", [])[:2]:
+            top3.append((alt["crop"], alt["confidence"]))
+        return top3, data.get("note", "")
+    except Exception as e:
+        return None, str(e)
+
+
+def voice_button(text, key="v"):
+    clean = text.replace("'", "").replace('"', "").replace("\n", " ")[:400]
+    st.components.v1.html(f"""
+    <button onclick="speak_{key}()" style="background:linear-gradient(135deg,#16a34a,#6366f1);
+        color:white;border:none;border-radius:12px;padding:.45rem 1.2rem;
+        cursor:pointer;font-size:.88rem;margin-top:.4rem;font-family:sans-serif;">
+        🔊 Read Aloud
+    </button>
+    <script>
+    function speak_{key}(){{
+        window.speechSynthesis.cancel();
+        var u=new SpeechSynthesisUtterance("{clean}");
+        u.rate=0.9;u.pitch=1.1;u.lang="en-IN";
+        window.speechSynthesis.speak(u);
+    }}
+    </script>""", height=55)
+
+
+def show_top3(top3):
+    medals = ["🥇", "🥈", "🥉"]
+    st.markdown('<div class="section-title">Top Predictions</div>', unsafe_allow_html=True)
+    for i, (crop, conf) in enumerate(top3):
+        pct = min(100, round(conf, 1))
+        st.markdown(f"""
+        <div class="top3-item">
+            <span class="top3-rank">{medals[i]}</span>
+            <span class="top3-name">{crop.title()}</span>
+            <div style="flex:2"><div class="conf-bar-wrap">
+                <div class="conf-bar" style="width:{pct}%"></div>
+            </div></div>
+            <span class="top3-pct">{pct}%</span>
+        </div>""", unsafe_allow_html=True)
+
+
+def show_crop_card(crop_name, info):
+    st.markdown(f"""
+    <div class="info-card" style="border-left:4px solid {info['color']}">
+        <h3 style="font-family:'Syne',sans-serif;margin:0 0 1rem;font-size:1.4rem;">
+            {info['emoji']} {crop_name.title()} — Crop Profile
+        </h3>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:.8rem;">
+            <div><span style="color:#94a3b8;font-size:.78rem;">🌱 GROWING SEASON</span><br/>
+                 <strong>{info['season']}</strong></div>
+            <div><span style="color:#94a3b8;font-size:.78rem;">💧 WATER REQUIREMENT</span><br/>
+                 <strong>{info['water']}</strong></div>
+            <div><span style="color:#94a3b8;font-size:.78rem;">🌍 BEST SOIL TYPE</span><br/>
+                 <strong>{info['soil']}</strong></div>
+            <div><span style="color:#94a3b8;font-size:.78rem;">💰 MARKET PRICE (MSP)</span><br/>
+                 <strong style="color:{info['color']}">{info['price']}</strong></div>
+        </div>
+        <div style="margin-top:.8rem;">
+            <span style="color:#94a3b8;font-size:.78rem;">🐛 COMMON DISEASES</span><br/>
+            <span style="color:#ef4444;">{info['diseases']}</span>
+        </div>
+    </div>""", unsafe_allow_html=True)
+
+
+def show_diet_tab(crop_name, info):
+    nut = info.get("nutrition", {})
+    uses = info.get("diet_uses", [])
+    benefits = info.get("health_benefits", "")
+
+    st.markdown(f"""
+    <div style="text-align:center;padding:1rem 0 .5rem">
+        <span style="font-size:3rem">{info['emoji']}</span>
+        <h2 style="font-family:'Syne',sans-serif;color:#15803d;margin:.3rem 0">
+            {crop_name.title()} — Nutrition & Diet Report
+        </h2>
+        <p style="color:#64748b">Per 100g serving</p>
+    </div>""", unsafe_allow_html=True)
+
+    st.markdown('<div class="section-title">📊 Nutritional Values (per 100g)</div>', unsafe_allow_html=True)
+    nut_html = "".join(f"""
+        <div class="nut-box">
+            <div class="nut-val">{v}</div>
+            <div class="nut-lbl">{k}</div>
+        </div>""" for k, v in nut.items())
+    st.markdown(f'<div class="nut-grid">{nut_html}</div>', unsafe_allow_html=True)
+
+    st.markdown('<div class="section-title">🍽️ Common Dietary Uses</div>', unsafe_allow_html=True)
+    use_pills = "".join(f'<span class="use-pill">🍴 {u}</span>' for u in uses)
+    st.markdown(f'<div style="line-height:2.6">{use_pills}</div>', unsafe_allow_html=True)
+
+    st.markdown('<div class="section-title">💚 Health Benefits</div>', unsafe_allow_html=True)
+    st.markdown(f"""
+    <div class="benefit-box">
+        <p style="margin:0;font-size:.95rem;line-height:1.7;color:#1e293b">{benefits}</p>
+    </div>""", unsafe_allow_html=True)
+
+    voice_text = f"{crop_name} nutritional information. {benefits} Common uses include {', '.join(uses)}."
+    voice_button(voice_text, key=f"diet_{crop_name.replace(' ','_')}")
+
+
+def show_india_map(crop_name, info):
+    st.markdown('<div class="section-title">🗺️ Growing Regions in India</div>', unsafe_allow_html=True)
+    try:
+        import folium
+        from streamlit_folium import st_folium
+        m = folium.Map(location=[22.0, 80.0], zoom_start=4, tiles="CartoDB positron")
+        for loc in info["locations"]:
+            folium.CircleMarker(
+                location=[loc["lat"], loc["lon"]], radius=30,
+                color=info["color"], fill=True, fill_color=info["color"],
+                fill_opacity=0.12, weight=1,
+            ).add_to(m)
+            folium.CircleMarker(
+                location=[loc["lat"], loc["lon"]], radius=12,
+                color=info["color"], fill=True, fill_color=info["color"],
+                fill_opacity=0.75, weight=2,
+                popup=folium.Popup(
+                    f"<div style='font-family:sans-serif;padding:4px'>"
+                    f"<b>{info['emoji']} {loc['state']}</b><br/>"
+                    f"<span style='color:#666'>Major {crop_name.title()} region</span></div>",
+                    max_width=200),
+                tooltip=f"{info['emoji']} {loc['state']}",
+            ).add_to(m)
+            folium.Marker(
+                location=[loc["lat"], loc["lon"]],
+                icon=folium.DivIcon(
+                    html=f'<div style="font-size:15px;margin:-10px 0 0 -8px">{info["emoji"]}</div>',
+                    icon_size=(28, 28), icon_anchor=(14, 14)),
+            ).add_to(m)
+        st_folium(m, width=None, height=460, returned_objects=[], use_container_width=True)
+        pills = "".join(f'<span class="stat-pill">📍 {l["state"]}</span>' for l in info["locations"])
+        st.markdown(f'<div style="margin-top:.6rem;line-height:2.4">{pills}</div>', unsafe_allow_html=True)
+    except ImportError:
+        pills = "".join(f'<span class="stat-pill">📍 {l["state"]}</span>' for l in info["locations"])
+        st.markdown(f"""
+        <div class="info-card" style="text-align:center;border:2px dashed #bbf7d0">
+            <p style="color:#64748b;font-size:.85rem;margin:0 0 .8rem">
+                Install folium for interactive map:<br/>
+                <code>pip install folium streamlit-folium</code>
+            </p>
+            <div style="line-height:2.5">{pills}</div>
+        </div>""", unsafe_allow_html=True)
+
+
+def run_identification(img_proc, engine, groq_client, model, labels):
+    """Run AI identification. Returns (top3, note, canonical_crop_name, info) or (None,msg,None,None)."""
+    top3, note = None, ""
+    if engine in ["Groq Vision (Primary)", "Both"] and groq_client:
+        top3, note = predict_groq(img_proc, groq_client)
+    if (top3 is None or engine == "Local Model") and model:
+        top3 = predict_local(img_proc, model, labels)
+    if top3:
+        crop_name_raw = top3[0][0]
+        info, canonical = get_crop_info(crop_name_raw)
+        # Rebuild top3 with canonical names so Diet tab matches correctly
+        return top3, note, canonical, info
+    return None, note, None, None
+
+
+def get_image_input():
+    mode = st.radio("", ["📁 Upload File", "🔗 Image URL", "📷 Webcam"],
+                    horizontal=True, label_visibility="collapsed")
+    img, img_orig = None, None
+    if mode == "📁 Upload File":
+        f = st.file_uploader("", type=["jpg", "jpeg", "png", "webp"], label_visibility="collapsed")
         if f:
             img = Image.open(f)
-
-    elif source == "Image URL":
-        url = st.text_input("Paste any image URL here:",
-                            placeholder="https://example.com/crop.jpg")
+            img_orig = img.copy()
+            st.image(img, caption="Uploaded Image", use_container_width=True)
+    elif mode == "🔗 Image URL":
+        url = st.text_input("Paste image URL", placeholder="https://example.com/crop.jpg")
         if url:
-            with st.spinner("Loading image from URL…"):
-                img, err = load_image_from_url(url)
-            if err:
-                st.error(f"❌ {err}\n\nTip: Try downloading the image and uploading it directly.")
-            else:
-                st.success("✅ Image loaded successfully!")
-
-    elif source == "Webcam":
+            try:
+                r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+                img = Image.open(io.BytesIO(r.content))
+                img_orig = img.copy()
+                st.image(img, caption="From URL", use_container_width=True)
+            except Exception as e:
+                st.error(f"Cannot load image: {e}")
+    elif mode == "📷 Webcam":
+        st.info("📷 Allow camera when prompted")
         cam = st.camera_input("Take a photo")
         if cam:
             img = Image.open(cam)
+            img_orig = img.copy()
+    return img, img_orig
 
-    if img:
-        # Auto-clear on new image
-        h = image_hash(img)
-        if h != st.session_state.last_image_hash:
-            st.session_state.chat_history    = []
-            st.session_state.last_image_hash = h
-            st.session_state.id_name         = ""
-            st.session_state.report          = ""
-            st.session_state.top5            = []
 
-        st.image(img, use_column_width=True,
-                 caption="Uploaded image — ready for analysis")
-
-        if st.button("🚀  IDENTIFY CROP & GENERATE DIET REPORT"):
-            with st.spinner("🔍 Running AI analysis…"):
-
-                # ── Step 1: Groq Vision (primary — very accurate) ──
-                groq_label, groq_conf, groq_reason, groq_top5 = groq_identify(img)
-
-                # ── Step 2: Local ML (fallback only) ──
-                local_label, local_conf, _ = local_predict(img)
-
-                # ── Step 3: Pick best result ──
-                if groq_label != "unknown" and groq_conf > 0:
-                    final_label  = groq_label
-                    final_conf   = groq_conf
-                    id_source    = "🤖 Groq Vision AI"
-                    is_unclear   = groq_conf < 50
-                    top5         = groq_top5   # use Groq alternatives
-                else:
-                    # Fallback to local model
-                    final_label  = local_label
-                    final_conf   = local_conf
-                    id_source    = "🧠 Local ML Model"
-                    is_unclear   = local_conf < 45
-                    top5         = []
-
-                # ── Step 4: Generate diet report ──
-                report = groq_diet_report(img, final_label)
-
-                st.session_state.id_name      = final_label
-                st.session_state.confidence   = final_conf
-                st.session_state.is_unclear   = is_unclear
-                st.session_state.top5         = top5
-                st.session_state.report       = report
-                st.session_state.id_source    = id_source
-                st.session_state.id_reason    = groq_reason
-                st.session_state.chat_history = []
-
-            st.rerun()
-
-    # ── Results ──
-    if st.session_state.id_name:
+def render_sidebar():
+    with st.sidebar:
+        st.markdown("## 🌿 CropID")
         st.markdown("---")
+        st.markdown("### 📤 Upload Mode")
+        mode = st.radio("", ["Single Image", "Dual-Image Batch"], label_visibility="collapsed")
+        st.markdown("---")
+        st.markdown("### 🤖 AI Engine")
+        engine = st.selectbox("", ["Groq Vision (Primary)"], label_visibility="collapsed")
+        st.markdown("---")
+        st.markdown("""
+        <div style="font-size:.82rem;color:#374151;line-height:2">
+        ✅ Upload / URL / Webcam<br/>
+        ✅ Top-3 confidence scores<br/>
+        ✅ Crop profile & diseases<br/>
+        ✅ Nutrition & Diet report<br/>
+        ✅ Interactive India map<br/>
+        ✅ Voice readout<br/>
+        ✅ AI expert chatbot<br/><br/>
+        🔑 <a href="https://console.groq.com" target="_blank" style="color:#16a34a">Groq API key</a><br/>
+        🗺️ Map: <code style="font-size:.7rem">pip install folium streamlit-folium</code>
+        </div>""", unsafe_allow_html=True)
+    return mode, engine
 
-        conf       = st.session_state.confidence
-        is_unclear = st.session_state.is_unclear
-        conf_color = "#c0392b" if is_unclear else ("#e67e22" if conf < 70 else "#1a7a42")
-        status_txt = "⚠️ Unclear" if is_unclear else "✅ Clear"
 
-        st.markdown(f"""
-        <div class='metric-row'>
-          <div class='metric-card' style='background:linear-gradient(135deg,#1a5c35,#2e8b57)'>
-            <div class='m-val'>{st.session_state.id_name}</div>
-            <div class='m-lbl'>Identified Crop</div>
-          </div>
-          <div class='metric-card' style='background:{conf_color}'>
-            <div class='m-val'>{conf}%</div>
-            <div class='m-lbl'>Confidence</div>
-          </div>
-          <div class='metric-card' style='background:#2c3e50'>
-            <div class='m-val'>{status_txt}</div>
-            <div class='m-lbl'>Image Quality</div>
-          </div>
-        </div>
-        """, unsafe_allow_html=True)
+def init_session():
+    defaults = {
+        "last_crop": None,
+        "last_info": None,
+        # Each entry: (canonical_crop_name, info_dict, confidence_float)
+        "identified_crops": [],
+        "chat_history": [],
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
 
-        # Source badge
-        badge_color = "#1a5c35" if "Groq" in st.session_state.id_source else "#7f8c8d"
-        st.markdown(f"""
-        <span class='source-badge' style='background:{badge_color};color:white'>
-          {st.session_state.id_source}
-        </span>
-        """, unsafe_allow_html=True)
 
-        if st.session_state.id_reason:
-            st.caption(f"💡 {st.session_state.id_reason}")
+def _add_crop_to_session(crop_name, info, conf):
+    """Add an identified crop to session state without duplicates."""
+    existing_names = [c[0] for c in st.session_state.identified_crops]
+    if crop_name not in existing_names:
+        st.session_state.identified_crops.append((crop_name, info, conf))
+    st.session_state.last_crop = crop_name
+    st.session_state.last_info = info
 
-        if is_unclear:
-            st.warning("⚠️ **Low confidence** — try a clearer, well-lit photo.")
 
-        tab_id, tab_diet = st.tabs(["🆔 Identification", "🥗 Diet & Nutrition Report"])
+def main():
+    inject_css()
+    init_session()
+    mode, engine = render_sidebar()
 
-        with tab_id:
-            st.markdown("#### 📊 Top 5 Predictions (Groq Vision AI)")
-            if st.session_state.top5:
-                render_pred_bars(st.session_state.top5)
-            st.info("💡 **Groq Vision AI** identifies the crop directly from the image — highly accurate.")
+    st.markdown("""
+    <div class="hero">
+        <h1>🌿 CropID</h1>
+        <p>AI Crop Identification · Diet & Nutrition Report · Interactive India Map · Voice Output</p>
+    </div>""", unsafe_allow_html=True)
 
-        with tab_diet:
-            if st.session_state.report:
-                st.markdown(st.session_state.report)
+    model, labels = load_model()
+    groq_client = get_groq()
 
-# ── RIGHT COLUMN — Chatbot ──
-with col_right:
-    st.markdown("### 💬 Crop & Nutrition Expert Chat")
-    st.caption("Ask about nutrition, recipes, diet plans, or health benefits.")
+    if not groq_client:
+        st.warning("⚠️ Groq API key missing. Add GROQ_API_KEY to .env file.")
+    if not TF_AVAILABLE or model is None:
+        st.info("ℹ️ Using Groq Vision only — works perfectly!")
 
-    chat_box = st.container(height=520)
-    for msg in st.session_state.chat_history:
-        with chat_box.chat_message(msg["role"]):
-            st.markdown(msg["content"])
+    tab1, tab2, tab3 = st.tabs(["🔍 Identify Crop", "🥗 Diet & Nutrition", "💬 Ask AI Expert"])
 
-    if not st.session_state.id_name:
-        st.info("👈 Identify a crop first, then ask the expert!")
+    # ════ TAB 1 — IDENTIFY ═══════════════════════════════════════════════════
+    with tab1:
+        if mode == "Single Image":
+            col_up, col_res = st.columns([1, 1], gap="large")
+            with col_up:
+                st.markdown('<div class="section-title">Select Input Method</div>', unsafe_allow_html=True)
+                img, img_orig = get_image_input()
+                if img:
+                    enhance = st.checkbox("✨ Auto-enhance image", value=True)
+                    img_proc = enhance_image(img) if enhance else img
+                    identify = st.button("🔍 Identify Crop", use_container_width=True)
+                else:
+                    identify = False
+                    img_proc = None
 
-    if q := st.chat_input("e.g. Is this good for diabetics? Best recipes?"):
-        st.session_state.chat_history.append({"role": "user", "content": q})
-        with chat_box.chat_message("user"):
-            st.markdown(q)
+            with col_res:
+                if img and identify:
+                    with st.spinner("Analysing your crop image..."):
+                        time.sleep(0.2)
+                        top3, note, crop_name, info = run_identification(
+                            img_proc, engine, groq_client, model, labels
+                        )
 
-        with chat_box.chat_message("assistant"):
-            system = (
-                f"You are a certified nutritionist and agricultural expert. "
-                f"Identified crop: **{st.session_state.id_name}** "
-                f"(confidence: {st.session_state.confidence}%, "
-                f"source: {st.session_state.id_source}). "
-                f"Diet report:\n\n{st.session_state.report}\n\n"
-                "Answer concisely. Focus on diet, nutrition, recipes, health only."
+                    if top3:
+                        conf = top3[0][1]
+                        # ── KEY FIX: always save to session, regardless of input mode ──
+                        _add_crop_to_session(crop_name, info, conf)
+
+                        st.markdown(f"""
+                        <div class="result-card">
+                            <div style="font-size:3rem">{info['emoji']}</div>
+                            <h2>{crop_name.title()}</h2>
+                            <p style="color:#64748b;margin:.2rem 0 .5rem">{note or 'Identified by AI'}</p>
+                            <span class="stat-pill">✅ {conf:.1f}% confidence</span>
+                        </div>""", unsafe_allow_html=True)
+
+                        voice_button(
+                            f"The crop identified is {crop_name}. Confidence {conf:.0f} percent. "
+                            f"Growing season is {info['season']}. Water requirement is {info['water']}.",
+                            key="id"
+                        )
+                        show_top3(top3)
+                        show_crop_card(crop_name, info)
+                        show_india_map(crop_name, info)
+
+                        if img_orig:
+                            st.markdown('<div class="section-title">Image Comparison</div>', unsafe_allow_html=True)
+                            c1, c2 = st.columns(2)
+                            with c1:
+                                st.image(img_orig, caption="Original", use_container_width=True)
+                            with c2:
+                                st.image(img_proc, caption="Enhanced", use_container_width=True)
+
+                        st.success("✅ Done! Switch to the **🥗 Diet & Nutrition** tab to see the full report.")
+                    else:
+                        st.error("❌ Could not identify. Try a clearer image or check Groq API key.")
+
+        else:
+            # ── BATCH MODE ────────────────────────────────────────────────────
+            st.markdown('<div class="section-title">Batch Upload</div>', unsafe_allow_html=True)
+            uploads = st.file_uploader(
+                "Upload multiple images", type=["jpg", "jpeg", "png", "webp"],
+                accept_multiple_files=True, label_visibility="collapsed"
             )
-            resp = client.chat.completions.create(
-                model=CHAT_MODEL,
-                messages=[
-                    {"role": "system", "content": system},
-                    *[{"role": m["role"], "content": m["content"]}
-                      for m in st.session_state.chat_history],
-                ],
-                max_tokens=1024
-            )
-            ans = resp.choices[0].message.content
-            st.markdown(ans)
-            st.session_state.chat_history.append({"role": "assistant", "content": ans})
+            if uploads and st.button("🔍 Identify All", use_container_width=True):
+                # Clear old batch results
+                st.session_state.identified_crops = []
+                results = []
+                prog = st.progress(0, text="Identifying...")
 
-    if st.session_state.chat_history:
-        if st.button("🗑️ Clear Chat"):
-            st.session_state.chat_history = []
-            st.rerun()
+                for i, f in enumerate(uploads):
+                    img_raw = Image.open(f)
+                    img_proc = enhance_image(img_raw)
+                    top3, note, crop_name, info = run_identification(
+                        img_proc, engine, groq_client, model, labels
+                    )
+                    if top3:
+                        conf = top3[0][1]
+                        results.append((f.name, crop_name, conf, Image.open(f)))
+                        _add_crop_to_session(crop_name, info, conf)
+                    prog.progress((i + 1) / len(uploads), text=f"{i + 1}/{len(uploads)} done")
+
+                if results:
+                    cols = st.columns(min(len(results), 3))
+                    for i, (fname, crop, conf, thumb) in enumerate(results):
+                        info_c, _ = get_crop_info(crop)
+                        with cols[i % 3]:
+                            st.image(thumb, use_container_width=True)
+                            st.markdown(f"""
+                            <div class="info-card" style="text-align:center">
+                                <div style="font-size:1.5rem">{info_c['emoji']}</div>
+                                <strong style="font-family:'Syne',sans-serif">{crop.title()}</strong>
+                                <p style="color:#64748b;font-size:.85rem;margin:.2rem 0">{conf:.1f}%</p>
+                                <p style="color:#94a3b8;font-size:.72rem">{fname}</p>
+                            </div>""", unsafe_allow_html=True)
+
+                    import pandas as pd
+                    st.markdown('<div class="section-title">Summary</div>', unsafe_allow_html=True)
+                    st.dataframe(
+                        pd.DataFrame(
+                            [(n, c.title(), f"{p:.1f}%") for n, c, p, _ in results],
+                            columns=["File", "Crop", "Confidence"]
+                        ), use_container_width=True
+                    )
+                    st.success(
+                        f"✅ {len(results)} crops identified! "
+                        "Switch to **🥗 Diet & Nutrition** to view each crop's report."
+                    )
+
+    # ════ TAB 2 — DIET & NUTRITION ════════════════════════════════════════════
+    with tab2:
+        identified = st.session_state.identified_crops
+
+        # Fallback: if somehow identified_crops is empty but last_crop is set
+        if not identified and st.session_state.last_crop:
+            identified = [(st.session_state.last_crop, st.session_state.last_info, 100.0)]
+
+        if identified:
+            if len(identified) == 1:
+                crop_name, info, conf = identified[0]
+                show_diet_tab(crop_name, info)
+            else:
+                st.markdown(
+                    '<div class="section-title">Select a Crop to View its Diet Report</div>',
+                    unsafe_allow_html=True
+                )
+                radio_labels = [
+                    f"{info['emoji']}  {crop.title()}  ({conf:.0f}% confidence)"
+                    for crop, info, conf in identified
+                ]
+                chosen_label = st.radio("Identified crops:", radio_labels, label_visibility="collapsed")
+                chosen_idx = radio_labels.index(chosen_label)
+                crop_name, info, conf = identified[chosen_idx]
+                st.markdown("---")
+                show_diet_tab(crop_name, info)
+        else:
+            st.markdown("""
+            <div class="info-card" style="text-align:center;padding:3rem;border:2px dashed #bbf7d0">
+                <div style="font-size:3rem">🥗</div>
+                <h3 style="font-family:'Syne',sans-serif;color:#15803d;margin:.5rem 0">
+                    No crop identified yet
+                </h3>
+                <p style="color:#64748b">
+                    Go to the <b>🔍 Identify Crop</b> tab, upload an image and click Identify.<br/>
+                    The full nutrition and diet report will appear here automatically!
+                </p>
+            </div>""", unsafe_allow_html=True)
+
+    # ════ TAB 3 — AI CHAT ════════════════════════════════════════════════════
+    with tab3:
+        st.markdown('<div class="section-title">Ask the Crop AI Expert</div>', unsafe_allow_html=True)
+        st.markdown("Ask anything — diseases, harvest time, soil, market prices, diet, nutrition…")
+
+        for role, msg in st.session_state.chat_history:
+            cls = "chat-user" if role == "user" else "chat-bot"
+            icon = "🧑" if role == "user" else "🤖"
+            st.markdown(f'<div class="{cls}">{icon}&nbsp; {msg}</div>', unsafe_allow_html=True)
+
+        user_q = st.chat_input("e.g. What are the health benefits of eating jowar?")
+        if user_q:
+            if groq_client:
+                st.session_state.chat_history.append(("user", user_q))
+                with st.spinner("Thinking..."):
+                    resp = groq_client.chat.completions.create(
+                        model="llama-3.3-70b-versatile",
+                        messages=[
+                            {"role": "system", "content": (
+                                "You are an expert Indian agricultural and nutritional advisor. "
+                                "Give practical, concise answers about Indian crops, farming, diseases, "
+                                "MSP prices, soil, weather, nutrition and diet plans. "
+                                "Keep responses under 150 words."
+                            )},
+                            *[{"role": r, "content": m} for r, m in st.session_state.chat_history],
+                        ],
+                        max_tokens=400,
+                    )
+                answer = resp.choices[0].message.content
+                st.session_state.chat_history.append(("assistant", answer))
+                voice_button(answer[:300], key=f"chat{len(st.session_state.chat_history)}")
+                st.rerun()
+            else:
+                st.error("❌ Groq API key not set.")
+
+        if st.session_state.chat_history:
+            if st.button("🗑️ Clear Chat"):
+                st.session_state.chat_history = []
+                st.rerun()
+
+
+if __name__ == "__main__":
+    main()
