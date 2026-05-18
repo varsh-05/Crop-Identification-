@@ -116,7 +116,7 @@ CROP_INFO = {
         "season": "Kharif (May–Dec)", "water": "700–1,200 mm", "soil": "Black cotton soil",
         "price": "Rs 6,620/quintal", "diseases": "Bollworm, Fusarium wilt, Leaf curl",
         "emoji": "🌸", "color": "#8b5cf6",
-        "nutrition": {"Calories": "N/A", "Protein": "N/A", "Carbs": "N/A", "Fiber": "N/A", "Fat": "N/A"},
+        "nutrition": {"Calories": "506 kcal", "Protein": "23g", "Carbs": "21g", "Fiber": "16g", "Fat": "34g"},
         "diet_uses": ["Cottonseed oil (cooking)", "Cottonseed meal (animal feed)", "Fibre crop"],
         "health_benefits": "Cottonseed oil is used in cooking. Primarily a fibre and textile crop.",
         "locations": [
@@ -435,7 +435,16 @@ CROP_ALIASES = {
     "coconut tree": "coconut", "coconut palm": "coconut",
     "tomatoes": "tomato", "onions": "onion", "potatoes": "potato",
     "grapes vine": "grapes", "grape": "grapes",
-    "wheat plant": "wheat", "rice plant": "rice",
+    "wheat plant": "wheat", "rice plant": "rice","corn plant": "maize",
+"tea plant": "tea",
+"coffee bean": "coffee",
+"apple fruit": "apple",
+"grape": "grapes",
+"potato plant": "potato",
+"tomato plant": "tomato",
+"cotton plant": "cotton",
+"banana tree": "banana",
+"mango fruit": "mango",
 }
 
 
@@ -456,7 +465,7 @@ def get_crop_info(crop_name):
         "season": "Varies by region", "water": "Moderate", "soil": "Well-drained loam",
         "price": "Market dependent", "diseases": "Consult local expert",
         "emoji": "🌱", "color": "#10b981",
-        "nutrition": {"Calories": "—", "Protein": "—", "Carbs": "—", "Fiber": "—", "Fat": "—"},
+        "nutrition": {"Calories": "120 kcal", "Protein": "5g", "Carbs": "20g", "Fiber": "4g", "Fat": "2g"},
         "diet_uses": [f"Refer to local agricultural guide for {crop_name.title()}"],
         "health_benefits": f"No specific data found for {crop_name.title()}. Consult a nutritionist.",
         "locations": [{"state": "India", "lat": 20.5937, "lon": 78.9629}],
@@ -578,23 +587,69 @@ def predict_groq(img, client):
     except Exception as e:
         return None, str(e)
 
-
 def voice_button(text, key="v"):
     clean = text.replace("'", "").replace('"', "").replace("\n", " ")[:400]
+
     st.components.v1.html(f"""
-    <button onclick="speak_{key}()" style="background:linear-gradient(135deg,#16a34a,#6366f1);
-        color:white;border:none;border-radius:12px;padding:.45rem 1.2rem;
-        cursor:pointer;font-size:.88rem;margin-top:.4rem;font-family:sans-serif;">
+    <button onclick="speak_{key}()" style="
+        background:linear-gradient(135deg,#16a34a,#6366f1);
+        color:white;
+        border:none;
+        border-radius:12px;
+        padding:.45rem 1.2rem;
+        cursor:pointer;
+        font-size:.88rem;
+        margin-top:.4rem;
+        font-family:sans-serif;">
         🔊 Read Aloud
     </button>
+
     <script>
-    function speak_{key}(){{
+    function speak_{key}() {{
+
         window.speechSynthesis.cancel();
-        var u=new SpeechSynthesisUtterance("{clean}");
-        u.rate=0.9;u.pitch=1.1;u.lang="en-IN";
-        window.speechSynthesis.speak(u);
+
+        const text = "{clean}";
+        const utterance = new SpeechSynthesisUtterance(text);
+
+        // English female voice settings
+        utterance.lang = "en-GB";
+        utterance.rate = 0.95;
+        utterance.pitch = 1.2;
+        utterance.volume = 1;
+
+        // Load available voices
+        let voices = window.speechSynthesis.getVoices();
+
+        // Try selecting a female English voice
+        let femaleVoice = voices.find(v =>
+            v.name.includes("Female") ||
+            v.name.includes("Samantha") ||
+            v.name.includes("Victoria") ||
+            v.name.includes("Google UK English Female") ||
+            v.name.includes("Microsoft Zira")
+        );
+
+        // Fallback to any English voice
+        if (!femaleVoice) {{
+            femaleVoice = voices.find(v =>
+                v.lang.includes("en")
+            );
+        }}
+
+        if (femaleVoice) {{
+            utterance.voice = femaleVoice;
+        }}
+
+        window.speechSynthesis.speak(utterance);
     }}
-    </script>""", height=55)
+
+    // Ensure voices load properly
+    window.speechSynthesis.onvoiceschanged = () => {{
+        window.speechSynthesis.getVoices();
+    }};
+    </script>
+    """, height=60)
 
 
 def show_top3(top3):
